@@ -1,6 +1,7 @@
 import type {
   Annotation,
   AnnotationKind,
+  Chapter,
   ConflictGroup,
   EditorState,
   SearchResult,
@@ -136,7 +137,7 @@ export function getSentence(document: TextDocument, sentenceId: string): Sentenc
   return undefined;
 }
 
-export function getTargetLabel(document: TextDocument, annotation: Annotation): string {
+export function getTargetLabel(document: Pick<TextDocument, 'chapters'>, annotation: Annotation): string {
   if (annotation.anchorType === 'chapter') {
     return document.chapters.find((chapter) => chapter.id === annotation.anchorId)?.title ?? '未知章节';
   }
@@ -154,6 +155,19 @@ export function getTargetLabel(document: TextDocument, annotation: Annotation): 
   }
 
   return '引用目标已迁移到所属句';
+}
+
+export function getAnchorSentenceText(chapters: Chapter[], annotation: Annotation): string {
+  if (annotation.anchorType === 'chapter') return '';
+  for (const chapter of chapters) {
+    for (const sentence of chapter.sentences) {
+      if (annotation.anchorType === 'sentence' && sentence.id === annotation.anchorId) return sentence.text;
+      if (annotation.anchorType === 'word' && sentence.tokens.some((token) => token.id === annotation.anchorId)) {
+        return sentence.text;
+      }
+    }
+  }
+  return '';
 }
 
 export function collectSearchResults(document: TextDocument, query: string): SearchResult[] {

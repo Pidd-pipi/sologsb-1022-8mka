@@ -21,6 +21,7 @@ import {
   AlertTriangle,
   BookOpen,
   Check,
+  ChevronDown,
   ChevronRight,
   CircleHelp,
   FileDown,
@@ -48,6 +49,7 @@ import {
   collectSearchResults,
   createInitialEditorState,
   editorReducer,
+  getAnchorSentenceText,
   getConflictGroups,
   getSentence,
   getTargetLabel,
@@ -78,6 +80,34 @@ const kindColors: Record<AnnotationKind, 'primary' | 'warning' | 'secondary' | '
   background: 'secondary',
   crossref: 'success'
 };
+
+const annotationStatusLabels: Record<Annotation['status'], string> = {
+  open: '待处理',
+  resolved: '已解决'
+};
+
+interface SentenceChange {
+  id: string;
+  label: string;
+  detail: string;
+}
+
+interface AnnotationFieldDiff {
+  field: string;
+  before: string;
+  after: string;
+}
+
+interface ChangedAnnotation {
+  annotation: Annotation;
+  diffs: AnnotationFieldDiff[];
+}
+
+interface RemovedAnnotation {
+  annotation: Annotation;
+  location: string;
+  excerpt: string;
+}
 
 function download(filename: string, content: string, type: string) {
   const blob = new Blob([content], { type });
@@ -338,6 +368,7 @@ export function TextAnnotationWorkbench() {
   const [editingSentenceId, setEditingSentenceId] = useState<string | null>(null);
   const [leftVersionId, setLeftVersionId] = useState('snapshot-base');
   const [rightVersionId, setRightVersionId] = useState('current');
+  const [expandedRemovedId, setExpandedRemovedId] = useState<string | null>(null);
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
   const searchRef = useRef<HTMLInputElement | null>(null);
@@ -585,11 +616,17 @@ export function TextAnnotationWorkbench() {
     const left = document.snapshots.find((item) => item.id === leftVersionId) ?? document.snapshots[0];
     const right =
       rightVersionId === 'current'
-        ? { chapters: document.chapters, annotations: document.annotations, label: '当前草稿' }
+        ? { id: 'current', label: '当前草稿', chapters: document.chapters, annotations: document.annotations }
         : document.snapshots.find((item) => item.id === rightVersionId);
-    if (!left || !right) return { left: null, right: null, changes: [] as { id: string; label: string; detail: string }[] };
 
-    const changes: { id: string; label: string; detail: string }[] = [];
+    const sentenceChanges: SentenceChange[] = [];
+    const addedAnnotations: Annotation[] = [];
+    const changedAnnotations: ChangedAnnotation[] = [];
+    const removedAnnotations: RemovedAnnotation[] = [];
+    if (!left || !right) {
+      return { left: left ?? null, right: right ?? null, sentenceChanges, addedAnnotations, changedAnnotations, removedAnnotations };
+    }
+
     const leftSentences = new Map(
       left.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => [sentence.id, { chapter, sentence }] as const))
     );
@@ -597,9 +634,9 @@ export function TextAnnotationWorkbench() {
       for (const sentence of chapter.sentences) {
         const previous = leftSentences.get(sentence.id);
         if (!previous) {
-          changes.push({ id: sentence.id, label: `${chapter.title} · 新增句`, detail: sentence.text });
+          sentenceChanges.push({ id: sentence.id, label: `${chapter.title} · 新增句`, detail: sentence.text });
         } else if (previous.sentence.text !== sentence.text) {
-          changes.push({
+          sentenceChanges.push({
             id: sentence.id,
             label: `${chapter.title} · 正文有改动`,
             detail: `${previous.sentence.text} → ${sentence.text}`
@@ -607,14 +644,113 @@ export function TextAnnotationWorkbench() {
         }
       }
     }
-    const leftAnnotationIds = new Set(left.annotations.map((item) => item.id));
+
+    const leftAnnotations = new Map(left.annotations.map((item) => [item.id, item] as const));
+    const rightAnnotationIds = new Set(right.annotations.map((item) => item.id));
     for (const annotation of right.annotations) {
-      if (!leftAnnotationIds.has(annotation.id)) {
-        changes.push({ id: annotation.id, label: `新增注释 · ${annotation.title}`, detail: annotation.body });
+      const previous = leftAnnotations.get(annotation.id);
+      if (!previous) {
+        addedAnnotations.push(annotation);
+        continue;
+      }
+      const diffs: AnnotationFieldDiff[] = [];
+      if (previous.title !== annotation.title) {
+        diffs.push({ field: '标题', before: previous.title, after: annotation.title });
+      }
+      if (previous.body !== annotation.body) {
+        diffs.push({ field: '正文', before: previous.body, after: annotation.body });
+      }
+      if (previous.source !== annotation.source) {
+        diffs.push({ field: '来源', before: previous.source, after: annotation.source });
+      }
+      const previousReferences = [...previous.references].sort();
+      const nextReferences = [...annotation.references].sort();
+      if (previousReferences.join('\n') !== nextReferences.join('\n')) {
+        diffs.push({
+          field: '引用',
+          before: previousReferences.join('、') || '无',
+          after: nextReferences.join('、') || '无'
+        });
+      }
+      if (previous.status !== annotation.status) {
+        diffs.push({
+          field: '处理状态',
+          before: annotationStatusLabels[previous.status],
+          after: annotationStatusLabels[annotation.status]
+        });
+      }
+      if (diffs.length) changedAnnotations.push({ annotation, diffs });
+    }
+
+    for (const annotation of left.annotations) {
+      if (rightAnnotationIds.has(annotation.id)) continue;
+      removedAnnotations.push({
+        annotation,
+        location: getTargetLabel({ chapters: left.chapters }, annotation),
+        excerpt: getAnchorSentenceText(left.chapters, annotation)
+      });
+    }
+
+    return { left, right, sentenceChanges, addedAnnotations, changedAnnotations, removedAnnotations };
+  }, [document, leftVersionId, rightVersionId]);
+
+  const totalChanges =
+    comparison.sentenceChanges.length +
+    comparison.addedAnnotations.length +
+    comparison.changedAnnotations.length +
+    comparison.removedAnnotations.length;
+
+  useEffect(() => {
+    setExpandedRemovedId(null);
+  }, [leftVersionId, rightVersionId]);
+
+  function scrollToElement(id: string) {
+    window.setTimeout(() => {
+      window.document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 60);
+  }
+
+  function jumpToSentence(sentenceId: string) {
+    for (const chapter of document.chapters) {
+      const sentence = chapter.sentences.find((item) => item.id === sentenceId);
+      if (sentence) {
+        dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: sentence.id });
+        scrollToElement(sentence.id);
+        return true;
       }
     }
-    return { left, right, changes };
-  }, [document, leftVersionId, rightVersionId]);
+    return false;
+  }
+
+  function jumpToAnnotationTarget(annotation: Annotation) {
+    const current = document.annotations.find((item) => item.id === annotation.id) ?? annotation;
+    const existsInDraft = document.annotations.some((item) => item.id === current.id);
+    if (current.anchorType === 'chapter') {
+      if (!document.chapters.some((chapter) => chapter.id === current.anchorId)) return;
+      dispatch({ type: 'selectChapter', chapterId: current.anchorId });
+      if (existsInDraft) dispatch({ type: 'selectAnnotation', annotationId: current.id });
+      return;
+    }
+    if (current.anchorType === 'sentence') {
+      if (!jumpToSentence(current.anchorId)) return;
+      setPendingAnchor(null);
+      if (existsInDraft) dispatch({ type: 'selectAnnotation', annotationId: current.id });
+      return;
+    }
+    for (const chapter of document.chapters) {
+      for (const sentence of chapter.sentences) {
+        const token = sentence.tokens.find((item) => item.id === current.anchorId);
+        if (!token) continue;
+        dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: sentence.id });
+        if (existsInDraft) dispatch({ type: 'selectAnnotation', annotationId: current.id });
+        window.setTimeout(() => {
+          setPendingAnchor({ id: token.id, type: 'word', preview: token.text });
+        }, 0);
+        scrollToElement(token.id);
+        return;
+      }
+    }
+  }
 
   function exportJson() {
     download(`${document.title}.json`, JSON.stringify(document, null, 2), 'application/json;charset=utf-8');
@@ -844,6 +980,7 @@ export function TextAnnotationWorkbench() {
                                 return (
                                   <button
                                     key={token.id}
+                                    id={token.id}
                                     type="button"
                                     className={`focus-ring rounded ${tokenAnnotations.length ? 'annotation-anchor' : 'hover:bg-amber-50'}`}
                                     aria-label={`${token.text}，${tokenAnnotations.length}条词语注释`}
@@ -1046,30 +1183,125 @@ export function TextAnnotationWorkbench() {
 
                       <div className="rounded-xl border border-stone-200">
                         <div className="flex items-center justify-between border-b border-stone-100 px-3 py-2 text-xs">
-                          <span>{comparison.changes.length} 处差异</span>
+                          <span>{totalChanges} 处差异</span>
                           {comparison.left ? <Button size="sm" variant="light" onPress={() => restoreVersion(comparison.left!.id)}>恢复左侧</Button> : null}
                         </div>
-                        <div className="max-h-72 space-y-2 overflow-y-auto p-2">
-                          {comparison.changes.map((change) => (
-                            <button
-                              key={`${change.id}-${change.label}`}
-                              type="button"
-                              className="w-full rounded-lg bg-stone-50 p-2 text-left hover:bg-amber-50"
-                              onClick={() => {
-                                for (const chapter of document.chapters) {
-                                  const sentence = chapter.sentences.find((item) => item.id === change.id);
-                                  if (sentence) {
-                                    dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: sentence.id });
-                                    break;
-                                  }
-                                }
-                              }}
-                            >
-                              <div className="text-xs font-semibold text-stone-800">{change.label}</div>
-                              <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-stone-500">{change.detail}</div>
-                            </button>
-                          ))}
-                          {!comparison.changes.length ? <p className="p-4 text-center text-xs text-stone-500">两个版本没有句子或注释差异。</p> : null}
+                        <div className="max-h-96 space-y-3 overflow-y-auto p-2">
+                          {comparison.sentenceChanges.length ? (
+                            <div className="space-y-2">
+                              <div className="px-1 text-[11px] font-semibold tracking-wider text-stone-400">
+                                句子改动 · {comparison.sentenceChanges.length}
+                              </div>
+                              {comparison.sentenceChanges.map((change) => (
+                                <button
+                                  key={change.id}
+                                  type="button"
+                                  className="w-full rounded-lg bg-stone-50 p-2 text-left hover:bg-amber-50"
+                                  onClick={() => jumpToSentence(change.id)}
+                                >
+                                  <div className="text-xs font-semibold text-stone-800">{change.label}</div>
+                                  <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-stone-500">{change.detail}</div>
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
+
+                          {comparison.addedAnnotations.length ? (
+                            <div className="space-y-2">
+                              <div className="px-1 text-[11px] font-semibold tracking-wider text-stone-400">
+                                新增注释 · {comparison.addedAnnotations.length}
+                              </div>
+                              {comparison.addedAnnotations.map((annotation) => (
+                                <button
+                                  key={annotation.id}
+                                  type="button"
+                                  className="w-full rounded-lg bg-stone-50 p-2 text-left hover:bg-amber-50"
+                                  onClick={() => jumpToAnnotationTarget(annotation)}
+                                >
+                                  <div className="flex items-center gap-2">
+                                    <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">{kindLabel(annotation.kind)}</Chip>
+                                    <span className="text-xs font-semibold text-stone-800">新增注释 · {annotation.title}</span>
+                                  </div>
+                                  <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-stone-500">{annotation.body}</div>
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
+
+                          {comparison.changedAnnotations.length ? (
+                            <div className="space-y-2">
+                              <div className="px-1 text-[11px] font-semibold tracking-wider text-stone-400">
+                                改动注释 · {comparison.changedAnnotations.length}
+                              </div>
+                              {comparison.changedAnnotations.map(({ annotation, diffs }) => (
+                                <button
+                                  key={annotation.id}
+                                  type="button"
+                                  className="w-full rounded-lg bg-stone-50 p-2 text-left hover:bg-amber-50"
+                                  onClick={() => jumpToAnnotationTarget(annotation)}
+                                >
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">{kindLabel(annotation.kind)}</Chip>
+                                    <span className="text-xs font-semibold text-stone-800">{annotation.title}</span>
+                                    {diffs.map((diff) => (
+                                      <Chip key={diff.field} size="sm" color="warning" variant="bordered">{diff.field}</Chip>
+                                    ))}
+                                  </div>
+                                  <div className="mt-1 space-y-0.5">
+                                    {diffs.map((diff) => (
+                                      <div key={diff.field} className="line-clamp-1 text-[11px] leading-4 text-stone-500">
+                                        <span className="font-semibold text-amber-700">{diff.field}</span>
+                                        {`：${diff.before} → ${diff.after}`}
+                                      </div>
+                                    ))}
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
+
+                          {comparison.removedAnnotations.length ? (
+                            <div className="space-y-2">
+                              <div className="px-1 text-[11px] font-semibold tracking-wider text-stone-400">
+                                已移除 · {comparison.removedAnnotations.length}
+                              </div>
+                              {comparison.removedAnnotations.map(({ annotation, location, excerpt }) => {
+                                const expanded = expandedRemovedId === annotation.id;
+                                return (
+                                  <div key={annotation.id} className="rounded-lg border border-stone-200 bg-stone-50">
+                                    <button
+                                      type="button"
+                                      className="w-full p-2 text-left"
+                                      onClick={() => setExpandedRemovedId(expanded ? null : annotation.id)}
+                                    >
+                                      <div className="flex items-center gap-2">
+                                        <Chip size="sm" color="danger" variant="flat">已移除</Chip>
+                                        <span className="text-xs font-semibold text-stone-800">{annotation.title}</span>
+                                        <ChevronDown
+                                          className={`ml-auto h-3.5 w-3.5 text-stone-400 transition-transform ${expanded ? 'rotate-180' : ''}`}
+                                        />
+                                      </div>
+                                      <div className="mt-1 text-[11px] leading-4 text-stone-500">{location}</div>
+                                    </button>
+                                    {expanded ? (
+                                      <div className="space-y-1 border-t border-stone-200 px-2 py-2 text-[11px] leading-4 text-stone-600">
+                                        <p><span className="font-semibold text-stone-700">位置：</span>{location}</p>
+                                        {excerpt ? <p><span className="font-semibold text-stone-700">锚点原文：</span>{excerpt}</p> : null}
+                                        <p><span className="font-semibold text-stone-700">来源：</span>{annotation.source}</p>
+                                        <p><span className="font-semibold text-stone-700">原正文：</span>{annotation.body}</p>
+                                        {annotation.references.length ? (
+                                          <p><span className="font-semibold text-stone-700">引用：</span>{annotation.references.join('、')}</p>
+                                        ) : null}
+                                        <p className="text-stone-400">已移除内容仅供核对，不会重新生成注释。</p>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : null}
+
+                          {!totalChanges ? <p className="p-4 text-center text-xs text-stone-500">两个版本没有句子或注释差异。</p> : null}
                         </div>
                       </div>
 
